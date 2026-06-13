@@ -79,7 +79,7 @@ for gIdx = 1:length(groupSizes)
     end
 
     % ── BF FindAll — K=5 skip (Out of Memory) ────────────────────────────
-    if K < 4
+    if K < 5
         t = tic;
         [bfValidGroups, bfValidScores, numBFFound] = bruteForceFindAll( ...
             distMat, NUE_pool, K, threshold, Inf);
@@ -313,24 +313,84 @@ function [W_pool, pool_indices, pool_pmi] = buildRepresentativePool(W_all, UE_Re
     targetPoolSize = getField(config, 'targetPoolSize', 200);
     kmeansMaxIter  = getField(config, 'kmeansMaxIter',  100);
 
-    [Nt, ~, N] = size(W_all);
+    % L: Số layer (thường là số cột của W)
+    [Nt, L, N] = size(W_all); 
     numClusters = min(numClusters, N);
 
-    % Feature: flatten projection matrix P = Q*Q'
-    P_features = zeros(N, Nt^2);
-    for k = 1:N
-        Q = orth(W_all(:,:,k));
-        P = real(Q * Q');
-        P_features(k,:) = P(:).';
+    % =========================================================
+    % BƯỚC 1: KHỞI TẠO TÂM CỤM (Chọn ngẫu nhiên từ data)
+    % =========================================================
+    % Khởi tạo tâm cụm A_c là các ma trận trực giao
+    rng('default'); % Cố định random seed để kết quả lặp lại được (tùy chọn)
+    init_idx = randperm(N, numClusters);
+    Centroids = zeros(Nt, L, numClusters);
+    for c = 1:numClusters
+        Centroids(:,:,c) = orth(W_all(:,:,init_idx(c)));
     end
 
-    % K-Means trên P_features
-    [labels, ~] = kmeans(P_features, numClusters, ...
-        'Distance',   'sqeuclidean', ...
-        'MaxIter',    kmeansMaxIter,  ...
-        'Replicates', 3);
+    labels = zeros(N, 1);
 
-    % Lấy đại diện gần centroid nhất (thay vì random)
+    % =========================================================
+    % BƯỚC 2 & 3: VÒNG LẶP K-MEANS CHUẨN BEAMFORMING
+    % =========================================================
+    for iter = 1:kmeansMaxIter
+        old_labels = labels;
+        
+        % 2. GÁN CỤM: Dựa trên khoảng cách Chordal
+        % Công thức rút gọn của Chordal: d^2 = L - Trace(A^H * W * W^H * A)
+        % Cách này chạy rất nhanh, không cần flatten ma trận
+        for k = 1:N
+            W_k = orth(W_all(:,:,k)); % Đảm bảo tính trực giao
+            W_proj = W_k * W_k';      % W * W^H
+            
+            min_dist = inf;
+            best_cluster = 1;
+            for c = 1:numClusters
+                A_c = Centroids(:,:,c);
+                % Tính khoảng cách Chordal (càng nhỏ càng tốt)
+                dist = L - real(trace(A_c' * W_proj * A_c)); 
+                
+                if dist < min_dist
+                    min_dist = dist;
+                    best_cluster = c;
+                end
+            end
+            labels(k) = best_cluster;
+        end
+        
+        % Kiểm tra điều kiện hội tụ (nếu các UE không đổi cụm nữa thì dừng)
+        if isequal(labels, old_labels)
+            break;
+        end
+        
+        % 3. CẬP NHẬT TÂM CỤM: Dùng SVD trên ma trận tương quan tổng R_c
+        for c = 1:numClusters
+            members = find(labels == c);
+            if isempty(members)
+                % Nếu cụm rỗng, chọn đại một UE ngẫu nhiên làm tâm mới
+                Centroids(:,:,c) = orth(W_all(:,:,randi(N)));
+                continue;
+            end
+            
+            % Tính ma trận tương quan tổng R_c
+            R_c = zeros(Nt, Nt);
+            for i = 1:length(members)
+                idx = members(i);
+                W_m = orth(W_all(:,:,idx));
+                R_c = R_c + (W_m * W_m'); 
+            end
+            
+            % Dùng SVD để tìm hướng năng lượng tập trung nhất
+            [U, ~, ~] = svd(R_c);
+            
+            % Cập nhật tâm mới bằng cách lấy L vector riêng lớn nhất
+            Centroids(:,:,c) = U(:, 1:L); 
+        end
+    end
+
+    % =========================================================
+    % BƯỚC 4: LẤY ĐẠI DIỆN GẦN CENTROID NHẤT CHO POOL
+    % =========================================================
     ues_per_cluster = ceil(targetPoolSize / numClusters);
     pool_indices    = [];
 
@@ -338,12 +398,16 @@ function [W_pool, pool_indices, pool_pmi] = buildRepresentativePool(W_all, UE_Re
         members = find(labels == c);
         if isempty(members), continue; end
 
-        % Centroid của cụm c trong feature space
-        centroid = mean(P_features(members, :), 1);
-
-        % Khoảng cách Euclidean đến centroid
-        diffs = P_features(members, :) - centroid;
-        d2    = sum(diffs.^2, 2);
+        A_c = Centroids(:,:,c);
+        
+        % Tính lại khoảng cách Chordal từ các member đến tâm A_c cuối cùng
+        d2 = zeros(length(members), 1);
+        for i = 1:length(members)
+            W_m = orth(W_all(:,:,members(i)));
+            d2(i) = L - real(trace(A_c' * W_m * W_m' * A_c));
+        end
+        
+        % Sắp xếp tăng dần (gần tâm nhất lên đầu)
         [~, ord] = sort(d2, 'ascend');
 
         num_to_pick  = min(ues_per_cluster, length(members));
